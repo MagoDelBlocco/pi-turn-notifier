@@ -6,9 +6,10 @@
 
 import { describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const notifierPath = path.join(__dirname, "..", "notifier.js");
@@ -23,13 +24,29 @@ describe("notifyUser", () => {
 		});
 	});
 
-	it("does not throw when spawn throws (notify-send missing)", async () => {
-		const { notifyUser } = await import("../notifier.js");
-		// notifyUser wraps spawn in try/catch, so even if spawn throws,
-		// it should not propagate.
-		assert.doesNotThrow(() => {
+	it("does not crash the process when notify-send is missing", () => {
+		// A missing notify-send surfaces as an asynchronous "error" event on
+		// the child process, which a try/catch around spawn does NOT catch.
+		// Run notifyUser in a real subprocess with an empty PATH (so notify-send
+		// cannot be resolved) and assert the process exits cleanly rather than
+		// dying from an uncaught ENOENT exception.
+		const child = `
+			import { notifyUser } from ${JSON.stringify(pathToFileURL(notifierPath).href)};
+			process.on("uncaughtException", () => process.exit(3));
+			process.on("unhandledRejection", () => process.exit(4));
 			notifyUser("Pi", "Awaiting your input");
-		});
+			setTimeout(() => process.exit(0), 500);
+		`;
+		const result = spawnSync(
+			process.execPath,
+			["--input-type=module", "-e", child],
+			{ env: { PATH: "" }, encoding: "utf-8" },
+		);
+		assert.equal(
+			result.status,
+			0,
+			`expected clean exit, got status=${result.status} signal=${result.signal}\n${result.stderr}`,
+		);
 	});
 });
 
@@ -126,6 +143,13 @@ describe("notifier.js spawn parameters", () => {
 		assert.ok(
 			src.includes("try") && src.includes("catch"),
 			"notifier.js must wrap spawn in try/catch",
+		);
+	});
+
+	it("registers an 'error' listener for async ENOENT (missing notify-send)", () => {
+		assert.ok(
+			/\.on\(\s*["']error["']/.test(src),
+			"notifier.js must attach an 'error' listener so a missing notify-send does not crash the process",
 		);
 	});
 
