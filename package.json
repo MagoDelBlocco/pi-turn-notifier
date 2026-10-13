@@ -1,7 +1,7 @@
 {
   "name": "turn-notifier",
   "version": "1.0.0",
-  "description": "Sends a desktop notification via notify-send when the pi agent loop ends and control returns to you",
+  "description": "Sends a desktop notification via notify-send when the pi agent run settles and control returns to you",
   "type": "module",
   "pi": {
     "extensions": ["./index.ts"]
@@ -10,6 +10,6 @@
     "test": "node --test tests/turn-notifier.test.js"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.74.0 <1.0.0"
+    "@earendil-works/pi-coding-agent": ">=0.80.4 <2.0.0"
   }
 }

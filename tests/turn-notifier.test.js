@@ -2,191 +2,264 @@
  * Tests for the turn-notifier extension.
  *
  * Run with: node --test tests/turn-notifier.test.js
+ *
+ * Everything here is verified behaviourally: a fake `notify-send` executable is
+ * placed on PATH in a real subprocess, so the assertions observe what actually
+ * reached the notification backend rather than what a source-code regex matched.
  */
 
-import { describe, it, mock } from "node:test";
+import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const notifierPath = path.join(__dirname, "..", "notifier.js");
+const repoRoot = path.join(__dirname, "..");
+const notifierPath = path.join(repoRoot, "notifier.js");
+const indexPath = path.join(repoRoot, "index.ts");
 
-// ── Tests for notifyUser (runtime behavior) ─────────────────────
+const notifierHref = pathToFileURL(notifierPath).href;
+const indexHref = pathToFileURL(indexPath).href;
+
+const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "turn-notifier-test-"));
+after(() => fs.rmSync(tmpRoot, { recursive: true, force: true }));
+
+/**
+ * Creates a directory containing a fake `notify-send`, and returns
+ * { binDir, logPath } where the fake records its argv.
+ */
+function makeFakeNotifySend(name, { sleepMs = 0, noise = false } = {}) {
+	const dir = fs.mkdtempSync(path.join(tmpRoot, `${name}-`));
+	const binDir = path.join(dir, "bin");
+	const logPath = path.join(dir, "notify.log");
+	fs.mkdirSync(binDir);
+
+	const script = [
+		"#!/bin/sh",
+		noise ? 'echo "stdout-noise"; echo "stderr-noise" >&2' : "",
+		sleepMs ? `sleep ${sleepMs / 1000}` : "",
+		`printf '%s\\n' "$@" > "$NOTIFY_LOG"`,
+	].filter(Boolean).join("\n");
+
+	fs.writeFileSync(path.join(binDir, "notify-send"), script, { mode: 0o755 });
+	return { binDir, logPath };
+}
+
+/**
+ * Runs a module in a subprocess. With `binDir`, the fake notify-send shadows the
+ * real one while the rest of the system PATH stays available (so /bin/sh helpers
+ * such as `sleep` resolve). With `emptyPath`, nothing resolves at all.
+ */
+function runSubprocess(code, { binDir, logPath, emptyPath = false, timeout = 15_000 } = {}) {
+	const PATH = emptyPath
+		? ""
+		: binDir
+			? `${binDir}:${process.env.PATH}`
+			: process.env.PATH;
+	return spawnSync(
+		process.execPath,
+		["--disable-warning=ExperimentalWarning", "--input-type=module", "-e", code],
+		{
+			encoding: "utf-8",
+			timeout,
+			env: { ...process.env, PATH, NOTIFY_LOG: logPath ?? "" },
+		},
+	);
+}
+
+function readArgv(logPath, { timeoutMs = 6000 } = {}) {
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		try {
+			return fs.readFileSync(logPath, "utf-8").split("\n").filter((l) => l !== "");
+		} catch {
+			if (Date.now() > deadline) return null;
+			const until = Date.now() + 50;
+			while (Date.now() < until) { /* spin: sync wait keeps tests simple */ }
+		}
+	}
+}
+
+function logExists(logPath) {
+	try {
+		fs.readFileSync(logPath);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/** Loads index.ts, builds a stub ExtensionAPI, and returns the registered handlers. */
+async function loadExtension() {
+	const handlers = {};
+	const registered = [];
+	const pi = {
+		on(event, handler) {
+			registered.push(event);
+			handlers[event] = handler;
+			return () => {};
+		},
+	};
+	const mod = await import(indexHref);
+	await mod.default(pi);
+	return { pi, handlers, registered };
+}
+
+// ── notifyUser: real spawn behaviour ─────────────────────────────
 
 describe("notifyUser", () => {
-	it("does not throw with valid arguments", async () => {
-		const { notifyUser } = await import("../notifier.js");
-		assert.doesNotThrow(() => {
+	it("invokes notify-send with summary then body", async () => {
+		const { binDir, logPath } = makeFakeNotifySend("argv");
+		const code = `
+			import { notifyUser } from ${JSON.stringify(notifierHref)};
 			notifyUser("Pi", "Awaiting your input");
-		});
+			setTimeout(() => process.exit(0), 1500);
+		`;
+		const result = runSubprocess(code, { binDir, logPath });
+		assert.equal(result.status, 0, `subprocess failed: ${result.stderr}`);
+		assert.deepEqual(readArgv(logPath), ["Pi", "Awaiting your input"]);
 	});
 
-	it("does not crash the process when notify-send is missing", () => {
-		// A missing notify-send surfaces as an asynchronous "error" event on
-		// the child process, which a try/catch around spawn does NOT catch.
-		// Run notifyUser in a real subprocess with an empty PATH (so notify-send
-		// cannot be resolved) and assert the process exits cleanly rather than
-		// dying from an uncaught ENOENT exception.
-		const child = `
-			import { notifyUser } from ${JSON.stringify(pathToFileURL(notifierPath).href)};
+	it("does not delay process exit and still notifies after exit", async () => {
+		// Exercises `stdio: "ignore"` and `.unref()` (and `detached`): a slow
+		// notify-send must not keep the agent alive, yet the detached child must
+		// still finish writing its notification after the parent has exited.
+		const { binDir, logPath } = makeFakeNotifySend("unref", { sleepMs: 2000 });
+		const code = `
+			import { notifyUser } from ${JSON.stringify(notifierHref)};
+			notifyUser("Pi", "Awaiting your input");
+			// No timer, no await: the process must be free to exit immediately.
+		`;
+		const started = Date.now();
+		const result = runSubprocess(code, { binDir, logPath });
+		const elapsed = Date.now() - started;
+
+		assert.equal(result.status, 0, `subprocess failed: ${result.stderr}`);
+		assert.ok(
+			elapsed < 1000,
+			`parent blocked for ${elapsed}ms waiting on the notification child`,
+		);
+		assert.deepEqual(readArgv(logPath), ["Pi", "Awaiting your input"]);
+	});
+
+	it("does not leak child output into the agent's stdio", async () => {
+		const { binDir, logPath } = makeFakeNotifySend("stdio", { noise: true });
+		const code = `
+			import { notifyUser } from ${JSON.stringify(notifierHref)};
+			notifyUser("Pi", "Awaiting your input");
+			setTimeout(() => process.exit(0), 1000);
+		`;
+		const result = runSubprocess(code, { binDir, logPath });
+		assert.equal(result.stdout, "", "child stdout must not reach the terminal");
+		assert.equal(result.stderr, "", "child stderr must not reach the terminal");
+	});
+
+	it("does not crash the agent when notify-send is missing", () => {
+		// A missing notify-send surfaces as an asynchronous "error" event on the
+		// child process, which a try/catch around spawn does NOT catch. Without a
+		// listener Node rethrows it as an uncaught exception.
+		const code = `
+			import { notifyUser } from ${JSON.stringify(notifierHref)};
 			process.on("uncaughtException", () => process.exit(3));
 			process.on("unhandledRejection", () => process.exit(4));
 			notifyUser("Pi", "Awaiting your input");
 			setTimeout(() => process.exit(0), 500);
 		`;
-		const result = spawnSync(
-			process.execPath,
-			["--input-type=module", "-e", child],
-			{ env: { PATH: "" }, encoding: "utf-8" },
-		);
+		const result = runSubprocess(code, { emptyPath: true }); // notify-send unresolvable
 		assert.equal(
 			result.status,
 			0,
 			`expected clean exit, got status=${result.status} signal=${result.signal}\n${result.stderr}`,
 		);
 	});
+
+	it("exports notifyUser as a callable named export", async () => {
+		const mod = await import(notifierHref);
+		assert.equal(typeof mod.notifyUser, "function");
+	});
 });
 
-// ── Tests for extension registration ─────────────────────────────
+// ── Extension registration against the current ExtensionAPI ──────
 
 describe("extension registration", () => {
-	it("registers an agent_end handler", async () => {
-		const registeredEvents = [];
-		const handlers = {};
-		const pi = {
-			on: mock.fn((event, handler) => {
-				registeredEvents.push(event);
-				handlers[event] = handler;
-			}),
-		};
+	it("registers exactly one agent_settled handler", async () => {
+		const { pi, handlers, registered } = await loadExtension();
 
-		const mod = await import("../index.ts");
-		mod.default(pi);
-
-		assert.equal(pi.on.mock.callCount(), 1);
-		assert.deepEqual(registeredEvents, ["agent_end"]);
-		assert.ok(typeof handlers.agent_end === "function");
+		assert.equal(registered.length, 1);
+		assert.deepEqual(registered, ["agent_settled"]);
+		assert.equal(typeof handlers.agent_settled, "function");
 	});
 
-	it("agent_end handler calls notifyUser with correct args", async () => {
-		const handlers = {};
-		const pi = {
-			on: (event, handler) => {
-				handlers[event] = handler;
-			},
-		};
-
-		const mod = await import("../index.ts");
-		mod.default(pi);
-
-		// Simulate agent_end firing
-		assert.doesNotThrow(async () => {
-			await handlers.agent_end({}, {});
-		});
-	});
-
-	it("fires only on agent_end (not on other events)", async () => {
-		const registeredEvents = [];
-		const pi = {
-			on: (event, _handler) => {
-				registeredEvents.push(event);
-			},
-		};
-
-		const mod = await import("../index.ts");
-		mod.default(pi);
-
-		assert.deepEqual(registeredEvents, ["agent_end"]);
-		assert.equal(registeredEvents.length, 1);
-	});
-});
-
-// ── Unit tests for notifier.js spawn arguments ───────────────────
-// These tests verify the spawn call parameters by reading the source
-// and checking for the expected patterns.
-
-describe("notifier.js spawn parameters", () => {
-	const src = fs.readFileSync(notifierPath, "utf-8");
-
-	it("passes 'notify-send' as command", () => {
+	it("does not subscribe to the low-level agent_end event", async () => {
+		const { registered } = await loadExtension();
 		assert.ok(
-			src.includes('spawn("notify-send"') || src.includes("'notify-send'"),
-			"notifier.js must spawn 'notify-send'",
+			!registered.includes("agent_end"),
+			"agent_end fires before retries/recovery settle and yields false notifications",
 		);
 	});
 
-	it("passes detached: true option", () => {
-		assert.ok(
-			src.includes("detached: true"),
-			"notifier.js must pass detached: true",
-		);
+	it("notifies when a settled run completed", async () => {
+		const { binDir, logPath } = makeFakeNotifySend("settled-ok");
+		const code = `
+			import { pathToFileURL } from "node:url";
+			const mod = await import(${JSON.stringify(indexHref)});
+			const handlers = {};
+			mod.default({ on: (event, handler) => { handlers[event] = handler; } });
+			await handlers.agent_settled({ type: "agent_settled", aborted: false });
+			setTimeout(() => process.exit(0), 1000);
+		`;
+		const result = runSubprocess(code, { binDir, logPath });
+		assert.equal(result.status, 0, `subprocess failed: ${result.stderr}`);
+		assert.deepEqual(readArgv(logPath), ["Pi", "Awaiting your input"]);
 	});
 
-	it("passes stdio: 'ignore' option", () => {
-		assert.ok(
-			src.includes("stdio: 'ignore'") || src.includes('stdio: "ignore"'),
-			"notifier.js must pass stdio: 'ignore'",
-		);
+	it("stays silent when the run was aborted (Escape)", async () => {
+		const { binDir, logPath } = makeFakeNotifySend("settled-aborted");
+		const code = `
+			const mod = await import(${JSON.stringify(indexHref)});
+			const handlers = {};
+			mod.default({ on: (event, handler) => { handlers[event] = handler; } });
+			await handlers.agent_settled({ type: "agent_settled", aborted: true });
+			setTimeout(() => process.exit(0), 1000);
+		`;
+		const result = runSubprocess(code, { binDir, logPath });
+		assert.equal(result.status, 0, `subprocess failed: ${result.stderr}`);
+		// Give a wrongly-fired notification time to land before asserting absence.
+		assert.equal(logExists(logPath), false, "aborted run must not notify");
 	});
 
-	it("calls .unref() on the child process", () => {
-		assert.ok(
-			src.includes(".unref()"),
-			"notifier.js must call .unref() on child process",
-		);
+	it("still notifies on backends whose agent_settled event has no aborted flag", async () => {
+		// `aborted` was added in Pi 1.1.0; on 0.80.4–1.0.x the field is absent.
+		const { binDir, logPath } = makeFakeNotifySend("settled-legacy");
+		const code = `
+			const mod = await import(${JSON.stringify(indexHref)});
+			const handlers = {};
+			mod.default({ on: (event, handler) => { handlers[event] = handler; } });
+			await handlers.agent_settled({ type: "agent_settled" });
+			setTimeout(() => process.exit(0), 1000);
+		`;
+		const result = runSubprocess(code, { binDir, logPath });
+		assert.equal(result.status, 0, `subprocess failed: ${result.stderr}`);
+		assert.deepEqual(readArgv(logPath), ["Pi", "Awaiting your input"]);
 	});
 
-	it("wraps spawn in try/catch for graceful failure", () => {
-		assert.ok(
-			src.includes("try") && src.includes("catch"),
-			"notifier.js must wrap spawn in try/catch",
-		);
-	});
-
-	it("registers an 'error' listener for async ENOENT (missing notify-send)", () => {
-		assert.ok(
-			/\.on\(\s*["']error["']/.test(src),
-			"notifier.js must attach an 'error' listener so a missing notify-send does not crash the process",
-		);
-	});
-
-	it("exports notifyUser as a named export", () => {
-		assert.ok(
-			src.includes("export function notifyUser") ||
-				src.includes("export { notifyUser }"),
-			"notifier.js must export notifyUser",
-		);
-	});
-
-	it("imports spawn from node:child_process", () => {
-		assert.ok(
-			src.includes("node:child_process"),
-			"notifier.js must import from node:child_process",
-		);
-	});
-});
-
-// ── Integration: verify the full flow ────────────────────────────
-
-describe("full flow integration", () => {
-	it("extension factory + agent_end handler + notifyUser end-to-end", async () => {
-		const handlers = {};
-		const pi = {
-			on: (event, handler) => {
-				handlers[event] = handler;
-			},
-		};
-
-		const mod = await import("../index.ts");
-		mod.default(pi);
-
-		// Verify handler exists
-		assert.ok(handlers.agent_end, "agent_end handler should be registered");
-
-		// Verify handler executes without error
-		await handlers.agent_end({}, {});
+	it("tolerates a rejecting notify backend without failing the settle dispatch", async () => {
+		// The handler must not reject: agent_settled handlers are awaited, and a
+		// rejected handler surfaces as an extension error in the host.
+		const { binDir, logPath } = makeFakeNotifySend("robust", { noise: true });
+		const code = `
+			const mod = await import(${JSON.stringify(indexHref)});
+			const handlers = {};
+			mod.default({ on: (event, handler) => { handlers[event] = handler; } });
+			for (let i = 0; i < 5; i++) {
+				await handlers.agent_settled({ type: "agent_settled", aborted: false });
+			}
+			process.exit(0);
+		`;
+		const result = runSubprocess(code, { binDir, logPath });
+		assert.equal(result.status, 0, `handler rejected: ${result.stderr}`);
 	});
 });
