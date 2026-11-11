@@ -3,9 +3,8 @@
  *
  * Run with: node --test tests/turn-notifier.test.js
  *
- * Everything here is verified behaviourally: a fake `notify-send` executable is
- * placed on PATH in a real subprocess, so the assertions observe what actually
- * reached the notification backend rather than what a source-code regex matched.
+ * A fake `notify-send` executable is placed on PATH in real subprocesses.
+ * Kitty output is checked through a captured stdout writer.
  */
 
 import { after, describe, it } from "node:test";
@@ -111,6 +110,35 @@ async function loadExtension() {
 // ── notifyUser: real spawn behaviour ─────────────────────────────
 
 describe("notifyUser", () => {
+	it("uses Kitty OSC 99 in an interactive Kitty terminal", () => {
+		const { binDir, logPath } = makeFakeNotifySend("kitty");
+		const code = `
+			import { appendFileSync } from "node:fs";
+			import { notifyUser } from ${JSON.stringify(notifierHref)};
+			process.env.KITTY_WINDOW_ID = "1";
+			process.stdout.isTTY = true;
+			process.stdout.write = (chunk) => { appendFileSync(process.env.NOTIFY_LOG, chunk); return true; };
+			notifyUser("Pi", "Awaiting your input");
+		`;
+		const result = runSubprocess(code, { binDir, logPath });
+		assert.equal(result.status, 0, `subprocess failed: ${result.stderr}`);
+		assert.equal(fs.readFileSync(logPath, "utf8"), "\x1b]99;i=1:d=0;Pi\x1b\\\x1b]99;i=1:p=body;Awaiting your input\x1b\\");
+	});
+
+	it("does not write Kitty escape sequences to non-interactive output", () => {
+		const { binDir, logPath } = makeFakeNotifySend("kitty-pipe");
+		const code = `
+			import { notifyUser } from ${JSON.stringify(notifierHref)};
+			process.env.KITTY_WINDOW_ID = "1";
+			notifyUser("Pi", "Awaiting your input");
+			setTimeout(() => process.exit(0), 500);
+		`;
+		const result = runSubprocess(code, { binDir, logPath });
+		assert.equal(result.status, 0, `subprocess failed: ${result.stderr}`);
+		assert.equal(result.stdout, "");
+		assert.deepEqual(readArgv(logPath), ["Pi", "Awaiting your input"]);
+	});
+
 	it("invokes notify-send with summary then body", async () => {
 		const { binDir, logPath } = makeFakeNotifySend("argv");
 		const code = `

@@ -1,12 +1,14 @@
 # turn-notifier
 
-Sends a desktop notification when the pi agent run has fully settled and control
+Sends a notification when the pi agent run has fully settled and control
 returns to you.
 
 ## What It Does
 
-Listens for the **`agent_settled`** event and sends a `notify-send` notification
-with the message **"Awaiting your input"**.
+Listens for the **`agent_settled`** event and sends a notification with the
+message **"Awaiting your input"**. In an interactive Kitty terminal it uses
+Kitty's OSC 99 notification protocol, including over SSH. Elsewhere it uses
+`notify-send`.
 
 `agent_settled` is the final, notification-only boundary of a run: Pi has no
 remaining automatic retry, overflow/compaction recovery, or queued follow-up
@@ -31,14 +33,14 @@ settles.
 
 ## Requirements
 
-- `notify-send` (provided by `libnotify-bin` on most Linux distros) and a running
-  notification daemon. If `notify-send` is missing the notification is skipped —
+- For non-Kitty terminals, `notify-send` (provided by `libnotify-bin` on most Linux
+  distros) and a running notification daemon. If `notify-send` is missing, the
+  notification is skipped —
   `notifier.js` swallows both the synchronous spawn failure and the asynchronous
   `ENOENT` `error` event, so a missing dependency never crashes the agent.
-- Linux-only by design. In WSL, headless sessions, or terminals that own their
-  notification channel (Ghostty, iTerm2, Kitty, Windows Terminal), `notify-send`
-  is a no-op; see Pi's bundled `notify.ts` example, which uses OSC 777 / OSC 99 /
-  Windows toast escape sequences instead.
+- In non-interactive output, Kitty escape sequences are suppressed. Other remote
+  terminals may need their own terminal notification protocol; Pi's bundled
+  `notify.ts` example supports additional terminals.
 
 ## Installation
 
@@ -52,8 +54,8 @@ Requires Pi **>= 0.80.4** (when `agent_settled` was introduced).
 node --test tests/turn-notifier.test.js
 ```
 
-The suite puts a fake `notify-send` on `PATH` inside real subprocesses and asserts
-on what actually reaches it — argument order, non-blocking exit, stdio isolation,
-missing-binary resilience, and the `aborted` guard — rather than on source text.
+The suite puts a fake `notify-send` on `PATH` inside real subprocesses and checks
+the emitted Kitty escape sequences. It covers argument order, non-blocking exit,
+stdio isolation, missing-binary resilience, and the `aborted` guard.
 It relies on Node's native TypeScript type stripping (Node >= 22.18) to import
 `index.ts`; pi itself loads the file through jiti.
